@@ -7,7 +7,6 @@ import (
 	"errors"
 	"log/slog"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ollama/ollama/x/mlxrunner/cache"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
@@ -18,13 +17,27 @@ func (r *Runner) TextGenerationPipeline(request Request) error {
 		return errors.New("model not loaded")
 	}
 
+	enableCompile := true
+	if modelCompile, ok := r.Model.(interface{ EnableCompile() bool }); ok {
+		enableCompile = modelCompile.EnableCompile()
+	}
+	if enableCompile {
+		mlx.EnableCompile()
+	} else {
+		mlx.DisableCompile()
+	}
+
 	inputs := r.Tokenizer.Encode(request.Prompt, true)
 
 	caches, tokens := r.FindNearestCache(inputs)
 	if len(caches) == 0 {
-		caches = make([]cache.Cache, r.Model.NumLayers())
-		for i := range caches {
-			caches[i] = cache.NewKVCache()
+		if cacheFactory, ok := r.Model.(interface{ NewCaches() []cache.Cache }); ok {
+			caches = cacheFactory.NewCaches()
+		} else {
+			caches = make([]cache.Cache, r.Model.NumLayers())
+			for i := range caches {
+				caches[i] = cache.NewKVCache()
+			}
 		}
 	}
 
@@ -47,7 +60,8 @@ func (r *Runner) TextGenerationPipeline(request Request) error {
 	}
 
 	step := func(token *mlx.Array) (*mlx.Array, *mlx.Array) {
-		logits := r.Model.Unembed(r.Model.Forward(token.ExpandDims(0), caches))
+		fwd := r.Model.Forward(token.ExpandDims(0), caches)
+		logits := r.Model.Unembed(fwd)
 		logits = logits.Slice(mlx.Slice(), mlx.Slice(logits.Dim(1)-1), mlx.Slice()).Squeeze(1)
 
 		logprobs := logits.Subtract(logits.Logsumexp(true))
@@ -60,7 +74,7 @@ func (r *Runner) TextGenerationPipeline(request Request) error {
 	var b bytes.Buffer
 
 	now := time.Now()
-	final := Response{PromptTokens: total, CompletionTokens: request.Options.MaxTokens, DoneReason: 1}
+	final := Response{Done: true, PromptTokens: total, CompletionTokens: request.Options.MaxTokens, DoneReason: 1}
 	outputs := make([]int32, 0, request.Options.MaxTokens)
 	for i := range request.Options.MaxTokens {
 		nextSample, nextLogprobs := step(sample)
@@ -111,13 +125,5 @@ func (r Runner) Decode(sample int32, b *bytes.Buffer) string {
 		return ""
 	}
 
-	if text := b.String(); utf8.ValidString(text) {
-		b.Reset()
-		return text
-	} else if b.Len() >= utf8.UTFMax {
-		b.Reset()
-		return text
-	}
-
-	return ""
+	return flushValidUTF8Prefix(b)
 }

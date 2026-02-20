@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/ollama/ollama/cmd/config"
 )
 
 var (
@@ -18,35 +19,38 @@ var (
 
 	selectorSelectedItemStyle = lipgloss.NewStyle().
 					PaddingLeft(2).
-					Bold(true)
+					Bold(true).
+					Background(lipgloss.AdaptiveColor{Light: "254", Dark: "236"})
 
 	selectorDescStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("241"))
+				Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "246"})
+
+	selectorDescLineStyle = selectorDescStyle.
+				PaddingLeft(6)
 
 	selectorFilterStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("241")).
+				Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "246"}).
 				Italic(true)
 
 	selectorInputStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("252"))
-
-	selectorCheckboxStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("241"))
-
-	selectorCheckboxCheckedStyle = lipgloss.NewStyle().
-					Bold(true)
+				Foreground(lipgloss.AdaptiveColor{Light: "235", Dark: "252"})
 
 	selectorDefaultTagStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("241")).
+				Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "246"}).
 				Italic(true)
 
 	selectorHelpStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("241"))
+				Foreground(lipgloss.AdaptiveColor{Light: "244", Dark: "244"})
 
 	selectorMoreStyle = lipgloss.NewStyle().
-				PaddingLeft(4).
-				Foreground(lipgloss.Color("241")).
+				PaddingLeft(6).
+				Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "246"}).
 				Italic(true)
+
+	sectionHeaderStyle = lipgloss.NewStyle().
+				PaddingLeft(2).
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "249"})
 )
 
 const maxSelectorItems = 10
@@ -54,10 +58,34 @@ const maxSelectorItems = 10
 // ErrCancelled is returned when the user cancels the selection.
 var ErrCancelled = errors.New("cancelled")
 
-// SelectItem represents an item that can be selected.
 type SelectItem struct {
 	Name        string
 	Description string
+	Recommended bool
+}
+
+// ConvertItems converts config.ModelItem slice to SelectItem slice.
+func ConvertItems(items []config.ModelItem) []SelectItem {
+	out := make([]SelectItem, len(items))
+	for i, item := range items {
+		out[i] = SelectItem{Name: item.Name, Description: item.Description, Recommended: item.Recommended}
+	}
+	return out
+}
+
+// ReorderItems returns a copy with recommended items first, then non-recommended,
+// preserving relative order within each group. This ensures the data order matches
+// the visual section layout (Recommended / More).
+func ReorderItems(items []SelectItem) []SelectItem {
+	var rec, other []SelectItem
+	for _, item := range items {
+		if item.Recommended {
+			rec = append(rec, item)
+		} else {
+			other = append(other, item)
+		}
+	}
+	return append(rec, other...)
 }
 
 // selectorModel is the bubbletea model for single selection.
@@ -69,6 +97,8 @@ type selectorModel struct {
 	scrollOffset int
 	selected     string
 	cancelled    bool
+	helpText     string
+	width        int
 }
 
 func (m selectorModel) filteredItems() []SelectItem {
@@ -89,83 +119,153 @@ func (m selectorModel) Init() tea.Cmd {
 	return nil
 }
 
+// otherStart returns the index of the first non-recommended item in the filtered list.
+// When filtering, all items scroll together so this returns 0.
+func (m selectorModel) otherStart() int {
+	if m.filter != "" {
+		return 0
+	}
+	filtered := m.filteredItems()
+	for i, item := range filtered {
+		if !item.Recommended {
+			return i
+		}
+	}
+	return len(filtered)
+}
+
+// updateNavigation handles navigation keys (up/down/pgup/pgdown/filter/backspace).
+// It does NOT handle Enter, Esc, or CtrlC. This is used by both the standalone
+// selector and the TUI modal (which intercepts Enter/Esc for its own logic).
+func (m *selectorModel) updateNavigation(msg tea.KeyMsg) {
+	filtered := m.filteredItems()
+	otherStart := m.otherStart()
+
+	switch msg.Type {
+	case tea.KeyUp:
+		if m.cursor > 0 {
+			m.cursor--
+			m.updateScroll(otherStart)
+		}
+
+	case tea.KeyDown:
+		if m.cursor < len(filtered)-1 {
+			m.cursor++
+			m.updateScroll(otherStart)
+		}
+
+	case tea.KeyPgUp:
+		m.cursor -= maxSelectorItems
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.updateScroll(otherStart)
+
+	case tea.KeyPgDown:
+		m.cursor += maxSelectorItems
+		if m.cursor >= len(filtered) {
+			m.cursor = len(filtered) - 1
+		}
+		m.updateScroll(otherStart)
+
+	case tea.KeyBackspace:
+		if len(m.filter) > 0 {
+			m.filter = m.filter[:len(m.filter)-1]
+			m.cursor = 0
+			m.scrollOffset = 0
+		}
+
+	case tea.KeyRunes:
+		m.filter += string(msg.Runes)
+		m.cursor = 0
+		m.scrollOffset = 0
+	}
+}
+
+// updateScroll adjusts scrollOffset based on cursor position.
+// When not filtering, scrollOffset is relative to the "More" (non-recommended) section.
+// When filtering, it's relative to the full filtered list.
+func (m *selectorModel) updateScroll(otherStart int) {
+	if m.filter != "" {
+		if m.cursor < m.scrollOffset {
+			m.scrollOffset = m.cursor
+		}
+		if m.cursor >= m.scrollOffset+maxSelectorItems {
+			m.scrollOffset = m.cursor - maxSelectorItems + 1
+		}
+		return
+	}
+
+	// Cursor is in recommended section — reset "More" scroll to top
+	if m.cursor < otherStart {
+		m.scrollOffset = 0
+		return
+	}
+
+	// Cursor is in "More" section — scroll relative to others
+	posInOthers := m.cursor - otherStart
+	maxOthers := maxSelectorItems - otherStart
+	if maxOthers < 3 {
+		maxOthers = 3
+	}
+	if posInOthers < m.scrollOffset {
+		m.scrollOffset = posInOthers
+	}
+	if posInOthers >= m.scrollOffset+maxOthers {
+		m.scrollOffset = posInOthers - maxOthers + 1
+	}
+}
+
 func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		filtered := m.filteredItems()
+	case tea.WindowSizeMsg:
+		wasSet := m.width > 0
+		m.width = msg.Width
+		if wasSet {
+			return m, tea.EnterAltScreen
+		}
+		return m, nil
 
+	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			m.cancelled = true
 			return m, tea.Quit
 
 		case tea.KeyEnter:
+			filtered := m.filteredItems()
 			if len(filtered) > 0 && m.cursor < len(filtered) {
 				m.selected = filtered[m.cursor].Name
 			}
 			return m, tea.Quit
 
-		case tea.KeyUp:
-			if m.cursor > 0 {
-				m.cursor--
-				if m.cursor < m.scrollOffset {
-					m.scrollOffset = m.cursor
-				}
-			}
-
-		case tea.KeyDown:
-			if m.cursor < len(filtered)-1 {
-				m.cursor++
-				if m.cursor >= m.scrollOffset+maxSelectorItems {
-					m.scrollOffset = m.cursor - maxSelectorItems + 1
-				}
-			}
-
-		case tea.KeyPgUp:
-			m.cursor -= maxSelectorItems
-			if m.cursor < 0 {
-				m.cursor = 0
-			}
-			m.scrollOffset -= maxSelectorItems
-			if m.scrollOffset < 0 {
-				m.scrollOffset = 0
-			}
-
-		case tea.KeyPgDown:
-			m.cursor += maxSelectorItems
-			if m.cursor >= len(filtered) {
-				m.cursor = len(filtered) - 1
-			}
-			if m.cursor >= m.scrollOffset+maxSelectorItems {
-				m.scrollOffset = m.cursor - maxSelectorItems + 1
-			}
-
-		case tea.KeyBackspace:
-			if len(m.filter) > 0 {
-				m.filter = m.filter[:len(m.filter)-1]
-				m.cursor = 0
-				m.scrollOffset = 0
-			}
-
-		case tea.KeyRunes:
-			m.filter += string(msg.Runes)
-			m.cursor = 0
-			m.scrollOffset = 0
+		default:
+			m.updateNavigation(msg)
 		}
 	}
 
 	return m, nil
 }
 
-func (m selectorModel) View() string {
-	// Clear screen when exiting
-	if m.cancelled || m.selected != "" {
-		return ""
+func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) {
+	if idx == m.cursor {
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
+	} else {
+		s.WriteString(selectorItemStyle.Render(item.Name))
 	}
+	s.WriteString("\n")
+	if item.Description != "" {
+		s.WriteString(selectorDescLineStyle.Render(item.Description))
+		s.WriteString("\n")
+	}
+}
 
+// renderContent renders the selector content (title, items, help text) without
+// checking the cancelled/selected state. This is used by both View() (standalone mode)
+// and by the TUI modal which embeds a selectorModel.
+func (m selectorModel) renderContent() string {
 	var s strings.Builder
 
-	// Title with filter
 	s.WriteString(selectorTitleStyle.Render(m.title))
 	s.WriteString(" ")
 	if m.filter == "" {
@@ -180,50 +280,112 @@ func (m selectorModel) View() string {
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
 		s.WriteString("\n")
-	} else {
-		displayCount := min(len(filtered), maxSelectorItems)
+	} else if m.filter != "" {
+		s.WriteString(sectionHeaderStyle.Render("Top Results"))
+		s.WriteString("\n")
 
+		displayCount := min(len(filtered), maxSelectorItems)
 		for i := range displayCount {
 			idx := m.scrollOffset + i
 			if idx >= len(filtered) {
 				break
 			}
-			item := filtered[idx]
-
-			if idx == m.cursor {
-				s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
-			} else {
-				s.WriteString(selectorItemStyle.Render(item.Name))
-			}
-
-			if item.Description != "" {
-				s.WriteString(" ")
-				s.WriteString(selectorDescStyle.Render("- " + item.Description))
-			}
-			s.WriteString("\n")
+			m.renderItem(&s, filtered[idx], idx)
 		}
 
 		if remaining := len(filtered) - m.scrollOffset - displayCount; remaining > 0 {
 			s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... and %d more", remaining)))
 			s.WriteString("\n")
 		}
+	} else {
+		// Split into pinned recommended and scrollable others
+		var recItems, otherItems []int
+		for i, item := range filtered {
+			if item.Recommended {
+				recItems = append(recItems, i)
+			} else {
+				otherItems = append(otherItems, i)
+			}
+		}
+
+		// Always render all recommended items (pinned)
+		if len(recItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Recommended"))
+			s.WriteString("\n")
+			for _, idx := range recItems {
+				m.renderItem(&s, filtered[idx], idx)
+			}
+		}
+
+		if len(otherItems) > 0 {
+			s.WriteString("\n")
+			s.WriteString(sectionHeaderStyle.Render("More"))
+			s.WriteString("\n")
+
+			maxOthers := maxSelectorItems - len(recItems)
+			if maxOthers < 3 {
+				maxOthers = 3
+			}
+			displayCount := min(len(otherItems), maxOthers)
+
+			for i := range displayCount {
+				idx := m.scrollOffset + i
+				if idx >= len(otherItems) {
+					break
+				}
+				m.renderItem(&s, filtered[otherItems[idx]], otherItems[idx])
+			}
+
+			if remaining := len(otherItems) - m.scrollOffset - displayCount; remaining > 0 {
+				s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... and %d more", remaining)))
+				s.WriteString("\n")
+			}
+		}
 	}
 
 	s.WriteString("\n")
-	s.WriteString(selectorHelpStyle.Render("↑/↓ navigate • enter select • esc cancel"))
+	help := "↑/↓ navigate • enter select • esc cancel"
+	if m.helpText != "" {
+		help = m.helpText
+	}
+	s.WriteString(selectorHelpStyle.Render(help))
 
 	return s.String()
 }
 
-// SelectSingle prompts the user to select a single item from a list.
-func SelectSingle(title string, items []SelectItem) (string, error) {
+func (m selectorModel) View() string {
+	if m.cancelled || m.selected != "" {
+		return ""
+	}
+
+	s := m.renderContent()
+	if m.width > 0 {
+		return lipgloss.NewStyle().MaxWidth(m.width).Render(s)
+	}
+	return s
+}
+
+// cursorForCurrent returns the item index matching current, or 0 if not found.
+func cursorForCurrent(items []SelectItem, current string) int {
+	if current != "" {
+		for i, item := range items {
+			if item.Name == current || strings.HasPrefix(item.Name, current+":") || strings.HasPrefix(current, item.Name+":") {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+func SelectSingle(title string, items []SelectItem, current string) (string, error) {
 	if len(items) == 0 {
 		return "", fmt.Errorf("no items to select from")
 	}
 
 	m := selectorModel{
-		title: title,
-		items: items,
+		title:  title,
+		items:  items,
+		cursor: cursorForCurrent(items, current),
 	}
 
 	p := tea.NewProgram(m)
@@ -252,6 +414,13 @@ type multiSelectorModel struct {
 	checkOrder   []int
 	cancelled    bool
 	confirmed    bool
+	width        int
+
+	// multi enables full multi-select editing mode. The zero value (false)
+	// shows a single-select picker where Enter adds the chosen model to
+	// the existing list. Tab toggles between modes.
+	multi     bool
+	singleAdd string // model picked in single mode
 }
 
 func newMultiSelectorModel(title string, items []SelectItem, preChecked []string) multiSelectorModel {
@@ -266,10 +435,20 @@ func newMultiSelectorModel(title string, items []SelectItem, preChecked []string
 		m.itemIndex[item.Name] = i
 	}
 
-	for _, name := range preChecked {
-		if idx, ok := m.itemIndex[name]; ok {
+	// Reverse order so preChecked[0] (the current default) ends up last
+	// in checkOrder, matching the "last checked = default" convention.
+	for i := len(preChecked) - 1; i >= 0; i-- {
+		if idx, ok := m.itemIndex[preChecked[i]]; ok {
 			m.checked[idx] = true
 			m.checkOrder = append(m.checkOrder, idx)
+		}
+	}
+
+	// Position cursor on the current default model
+	if len(preChecked) > 0 {
+		if idx, ok := m.itemIndex[preChecked[0]]; ok {
+			m.cursor = idx
+			m.updateScroll(m.otherStart())
 		}
 	}
 
@@ -288,6 +467,50 @@ func (m multiSelectorModel) filteredItems() []SelectItem {
 		}
 	}
 	return result
+}
+
+// otherStart returns the index of the first non-recommended item in the filtered list.
+func (m multiSelectorModel) otherStart() int {
+	if m.filter != "" {
+		return 0
+	}
+	filtered := m.filteredItems()
+	for i, item := range filtered {
+		if !item.Recommended {
+			return i
+		}
+	}
+	return len(filtered)
+}
+
+// updateScroll adjusts scrollOffset for section-based scrolling (matches single-select).
+func (m *multiSelectorModel) updateScroll(otherStart int) {
+	if m.filter != "" {
+		if m.cursor < m.scrollOffset {
+			m.scrollOffset = m.cursor
+		}
+		if m.cursor >= m.scrollOffset+maxSelectorItems {
+			m.scrollOffset = m.cursor - maxSelectorItems + 1
+		}
+		return
+	}
+
+	if m.cursor < otherStart {
+		m.scrollOffset = 0
+		return
+	}
+
+	posInOthers := m.cursor - otherStart
+	maxOthers := maxSelectorItems - otherStart
+	if maxOthers < 3 {
+		maxOthers = 3
+	}
+	if posInOthers < m.scrollOffset {
+		m.scrollOffset = posInOthers
+	}
+	if posInOthers >= m.scrollOffset+maxOthers {
+		m.scrollOffset = posInOthers - maxOthers + 1
+	}
 }
 
 func (m *multiSelectorModel) toggleItem() {
@@ -323,6 +546,14 @@ func (m multiSelectorModel) Init() tea.Cmd {
 
 func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		wasSet := m.width > 0
+		m.width = msg.Width
+		if wasSet {
+			return m, tea.EnterAltScreen
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		filtered := m.filteredItems()
 
@@ -331,31 +562,36 @@ func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelled = true
 			return m, tea.Quit
 
+		case tea.KeyTab:
+			m.multi = !m.multi
+
 		case tea.KeyEnter:
-			// Enter confirms if at least one item is selected
-			if len(m.checkOrder) > 0 {
+			if !m.multi {
+				if len(filtered) > 0 && m.cursor < len(filtered) {
+					m.singleAdd = filtered[m.cursor].Name
+					m.confirmed = true
+					return m, tea.Quit
+				}
+			} else if len(m.checkOrder) > 0 {
 				m.confirmed = true
 				return m, tea.Quit
 			}
 
 		case tea.KeySpace:
-			// Space always toggles selection
-			m.toggleItem()
+			if m.multi {
+				m.toggleItem()
+			}
 
 		case tea.KeyUp:
 			if m.cursor > 0 {
 				m.cursor--
-				if m.cursor < m.scrollOffset {
-					m.scrollOffset = m.cursor
-				}
+				m.updateScroll(m.otherStart())
 			}
 
 		case tea.KeyDown:
 			if m.cursor < len(filtered)-1 {
 				m.cursor++
-				if m.cursor >= m.scrollOffset+maxSelectorItems {
-					m.scrollOffset = m.cursor - maxSelectorItems + 1
-				}
+				m.updateScroll(m.otherStart())
 			}
 
 		case tea.KeyPgUp:
@@ -363,19 +599,14 @@ func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < 0 {
 				m.cursor = 0
 			}
-			m.scrollOffset -= maxSelectorItems
-			if m.scrollOffset < 0 {
-				m.scrollOffset = 0
-			}
+			m.updateScroll(m.otherStart())
 
 		case tea.KeyPgDown:
 			m.cursor += maxSelectorItems
 			if m.cursor >= len(filtered) {
 				m.cursor = len(filtered) - 1
 			}
-			if m.cursor >= m.scrollOffset+maxSelectorItems {
-				m.scrollOffset = m.cursor - maxSelectorItems + 1
-			}
+			m.updateScroll(m.otherStart())
 
 		case tea.KeyBackspace:
 			if len(m.filter) > 0 {
@@ -385,24 +616,76 @@ func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case tea.KeyRunes:
-			m.filter += string(msg.Runes)
-			m.cursor = 0
-			m.scrollOffset = 0
+			// On some terminals (e.g. Windows PowerShell), space arrives as
+			// KeyRunes instead of KeySpace. Intercept it so toggle still works.
+			if len(msg.Runes) == 1 && msg.Runes[0] == ' ' {
+				if m.multi {
+					m.toggleItem()
+				}
+			} else {
+				m.filter += string(msg.Runes)
+				m.cursor = 0
+				m.scrollOffset = 0
+			}
 		}
 	}
 
 	return m, nil
 }
 
+func (m multiSelectorModel) renderSingleItem(s *strings.Builder, item SelectItem, idx int) {
+	if idx == m.cursor {
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
+	} else {
+		s.WriteString(selectorItemStyle.Render(item.Name))
+	}
+	s.WriteString("\n")
+	if item.Description != "" {
+		s.WriteString(selectorDescLineStyle.Render(item.Description))
+		s.WriteString("\n")
+	}
+}
+
+func (m multiSelectorModel) renderMultiItem(s *strings.Builder, item SelectItem, idx int) {
+	origIdx := m.itemIndex[item.Name]
+
+	var check string
+	if m.checked[origIdx] {
+		check = "[x] "
+	} else {
+		check = "[ ] "
+	}
+
+	suffix := ""
+	if len(m.checkOrder) > 0 && m.checkOrder[len(m.checkOrder)-1] == origIdx {
+		suffix = " " + selectorDefaultTagStyle.Render("(default)")
+	}
+
+	if idx == m.cursor {
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + check + item.Name))
+	} else {
+		s.WriteString(selectorItemStyle.Render(check + item.Name))
+	}
+	s.WriteString(suffix)
+	s.WriteString("\n")
+	if item.Description != "" {
+		s.WriteString(selectorDescLineStyle.Render(item.Description))
+		s.WriteString("\n")
+	}
+}
+
 func (m multiSelectorModel) View() string {
-	// Clear screen when exiting
 	if m.cancelled || m.confirmed {
 		return ""
 	}
 
+	renderItem := m.renderSingleItem
+	if m.multi {
+		renderItem = m.renderMultiItem
+	}
+
 	var s strings.Builder
 
-	// Title with filter
 	s.WriteString(selectorTitleStyle.Render(m.title))
 	s.WriteString(" ")
 	if m.filter == "" {
@@ -417,65 +700,89 @@ func (m multiSelectorModel) View() string {
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
 		s.WriteString("\n")
-	} else {
+	} else if m.filter != "" {
+		// Filtering: flat scroll through all matches
 		displayCount := min(len(filtered), maxSelectorItems)
-
 		for i := range displayCount {
 			idx := m.scrollOffset + i
 			if idx >= len(filtered) {
 				break
 			}
-			item := filtered[idx]
-			origIdx := m.itemIndex[item.Name]
-
-			// Checkbox
-			var checkbox string
-			if m.checked[origIdx] {
-				checkbox = selectorCheckboxCheckedStyle.Render("[x]")
-			} else {
-				checkbox = selectorCheckboxStyle.Render("[ ]")
-			}
-
-			// Cursor and name
-			var line string
-			if idx == m.cursor {
-				line = selectorSelectedItemStyle.Render("▸ ") + checkbox + " " + selectorSelectedItemStyle.Render(item.Name)
-			} else {
-				line = "  " + checkbox + " " + item.Name
-			}
-
-			// Default tag
-			if len(m.checkOrder) > 0 && m.checkOrder[0] == origIdx {
-				line += " " + selectorDefaultTagStyle.Render("(default)")
-			}
-
-			s.WriteString(line)
-			s.WriteString("\n")
+			renderItem(&s, filtered[idx], idx)
 		}
 
 		if remaining := len(filtered) - m.scrollOffset - displayCount; remaining > 0 {
 			s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... and %d more", remaining)))
 			s.WriteString("\n")
 		}
+	} else {
+		// Split into pinned recommended and scrollable others (matches single-select layout)
+		var recItems, otherItems []int
+		for i, item := range filtered {
+			if item.Recommended {
+				recItems = append(recItems, i)
+			} else {
+				otherItems = append(otherItems, i)
+			}
+		}
+
+		// Always render all recommended items (pinned)
+		if len(recItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Recommended"))
+			s.WriteString("\n")
+			for _, idx := range recItems {
+				renderItem(&s, filtered[idx], idx)
+			}
+		}
+
+		if len(otherItems) > 0 {
+			s.WriteString("\n")
+			s.WriteString(sectionHeaderStyle.Render("More"))
+			s.WriteString("\n")
+
+			maxOthers := maxSelectorItems - len(recItems)
+			if maxOthers < 3 {
+				maxOthers = 3
+			}
+			displayCount := min(len(otherItems), maxOthers)
+
+			for i := range displayCount {
+				idx := m.scrollOffset + i
+				if idx >= len(otherItems) {
+					break
+				}
+				renderItem(&s, filtered[otherItems[idx]], otherItems[idx])
+			}
+
+			if remaining := len(otherItems) - m.scrollOffset - displayCount; remaining > 0 {
+				s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... and %d more", remaining)))
+				s.WriteString("\n")
+			}
+		}
 	}
 
 	s.WriteString("\n")
 
-	// Status line
-	count := m.selectedCount()
-	if count == 0 {
-		s.WriteString(selectorDescStyle.Render("  Select at least one model."))
+	if !m.multi {
+		s.WriteString(selectorHelpStyle.Render("↑/↓ navigate • enter select • tab add multiple • esc cancel"))
 	} else {
-		s.WriteString(selectorDescStyle.Render(fmt.Sprintf("  %d selected - press enter to continue", count)))
+		count := m.selectedCount()
+		if count == 0 {
+			s.WriteString(selectorDescStyle.Render("  Select at least one model."))
+		} else {
+			s.WriteString(selectorDescStyle.Render(fmt.Sprintf("  %d selected - press enter to continue", count)))
+		}
+		s.WriteString("\n\n")
+		s.WriteString(selectorHelpStyle.Render("↑/↓ navigate • space toggle • tab select single • enter confirm • esc cancel"))
 	}
-	s.WriteString("\n\n")
 
-	s.WriteString(selectorHelpStyle.Render("↑/↓ navigate • space toggle • enter confirm • esc cancel"))
-
-	return s.String()
+	result := s.String()
+	if m.width > 0 {
+		return lipgloss.NewStyle().MaxWidth(m.width).Render(result)
+	}
+	return result
 }
 
-// SelectMultiple prompts the user to select multiple items from a list.
 func SelectMultiple(title string, items []SelectItem, preChecked []string) ([]string, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("no items to select from")
@@ -490,18 +797,28 @@ func SelectMultiple(title string, items []SelectItem, preChecked []string) ([]st
 	}
 
 	fm := finalModel.(multiSelectorModel)
-	if fm.cancelled {
+	if fm.cancelled || !fm.confirmed {
 		return nil, ErrCancelled
 	}
 
-	if !fm.confirmed {
-		return nil, ErrCancelled
+	// Single-add mode: prepend the picked model, keep existing models deduped
+	if fm.singleAdd != "" {
+		result := []string{fm.singleAdd}
+		for _, name := range preChecked {
+			if name != fm.singleAdd {
+				result = append(result, name)
+			}
+		}
+		return result, nil
 	}
 
-	var result []string
+	// Multi-edit mode: last checked is default (first in result)
+	last := fm.checkOrder[len(fm.checkOrder)-1]
+	result := []string{fm.items[last].Name}
 	for _, idx := range fm.checkOrder {
-		result = append(result, fm.items[idx].Name)
+		if idx != last {
+			result = append(result, fm.items[idx].Name)
+		}
 	}
-
 	return result, nil
 }
